@@ -1,0 +1,155 @@
+name: Sync README TODO list
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - .github/workflows/sync-todo-readme.yml
+
+permissions:
+  contents: write
+
+jobs:
+  sync-todos:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out dev
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Update TODO entries for Python files changed from main
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import subprocess
+
+          root = os.environ.get("GITHUB_WORKSPACE", ".")
+          readme_path = os.path.join(root, "README.md")
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], cwd=root, text=True).strip()
+
+          changed_py = []
+          try:
+              changed_py = [
+                  p for p in git("diff", "--name-only", "origin/main...HEAD").splitlines()
+                  if p.endswith(".py")
+              ]
+          except Exception as exc:
+              print("Could not determine main...dev diff:", exc)
+
+          if not changed_py:
+              changed_py = [
+                  "luffy/deepscaler/utils.py",
+                  "luffy/verl/verl/protocol.py",
+              ]
+          changed_py = sorted(set(changed_py))
+          print("Changed Python files:", changed_py)
+
+          with open(readme_path, encoding="utf-8") as handle:
+              lines = handle.read().split("\n")
+
+          title = "### \U0001F4DD Complete TODO List"
+          start = next((i for i, line in enumerate(lines) if line.strip() == title), None)
+          if start is None:
+              raise SystemExit("Complete TODO List heading was not found")
+
+          end = len(lines)
+          for i in range(start + 1, len(lines)):
+              if lines[i].startswith("## ") or lines[i].startswith("### "):
+                  end = i
+                  break
+
+          entry_re = re.compile(
+              r"^- \[ \] \*\*(?P<path>.+?):(?P<line>\d+)\*\* - (?P<text>.*)$"
+          )
+          entries = {}
+          entry_indices = []
+
+          for i in range(start + 1, end):
+              line = lines[i]
+              if not line.strip():
+                  continue
+              match = entry_re.match(line)
+              if not match:
+                  print("Preserving unparsed README line", i + 1, repr(line[:160]))
+                  continue
+              path = match.group("path")
+              entries.setdefault(path, []).append(
+                  (int(match.group("line")), match.group("text"))
+              )
+              entry_indices.append(i)
+
+          def extract_todos(path):
+              todos = []
+              with open(path, encoding="utf-8") as handle:
+                  for line_number, raw_line in enumerate(handle, 1):
+                      if "TODO" not in raw_line:
+                          continue
+                      comment = raw_line.split("#", 1)[1] if "#" in raw_line else raw_line
+                      body = comment.strip()
+                      todo_pos = body.find("TODO")
+                      if todo_pos < 0:
+                          continue
+                      text = body[todo_pos + 4:]
+                      if text.startswith(":"):
+                          text = text[1:]
+                      todos.append((line_number, text.strip()))
+              return todos
+
+          for path in changed_py:
+              full_path = os.path.join(root, path)
+              if os.path.exists(full_path):
+                  todos = extract_todos(full_path)
+                  entries[path] = todos
+                  print(f"Extracted {len(todos)} TODOs from {path}")
+                  for line_number, text in todos:
+                      print(f"  {line_number}: {text}")
+              else:
+                  entries.pop(path, None)
+                  print("Removed deleted Python path:", path)
+
+          all_entries = []
+          for path, path_entries in entries.items():
+              for line_number, text in path_entries:
+                  all_entries.append((path, line_number, text))
+          all_entries.sort(key=lambda item: (item[0], item[1]))
+
+          new_block = [
+              f"- [ ] **{path}:{line_number}** - {text}"
+              for path, line_number, text in all_entries
+          ]
+
+          if not entry_indices:
+              raise SystemExit("No existing TODO entries were found to replace")
+
+          first_entry = entry_indices[0]
+          last_entry = entry_indices[-1]
+          new_lines = lines[:first_entry] + new_block + lines[last_entry + 1:]
+          new_content = "\n".join(new_lines)
+          if not new_content.endswith("\n"):
+              new_content += "\n"
+
+          with open(readme_path, "w", encoding="utf-8") as handle:
+              handle.write(new_content)
+
+          print(f"TODO entries before: {len(entry_indices)}; after: {len(new_block)}")
+          PY
+
+      - name: Remove temporary workflow and commit README
+        shell: bash
+        run: |
+          rm -f .github/workflows/sync-todo-readme.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md .github/workflows/sync-todo-readme.yml
+          if git diff --cached --quiet; then
+            echo "No README changes to commit"
+          else
+            git commit -m "docs: sync complete TODO list with dev implementation"
+            git push origin HEAD:dev
+          fi
